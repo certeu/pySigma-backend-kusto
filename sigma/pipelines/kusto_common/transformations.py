@@ -223,6 +223,9 @@ class SetQueryTableStateTransformation(Transformation):
             if isinstance(table_name, list):
                 table_name = table_name[0]  # Use the first table if it's a list
             self._pipeline.state["query_table"] = table_name
+            # Store table on SigmaRule so multi-rule correlation can look up per-rule table names
+            if isinstance(rule, SigmaRule):
+                rule._kusto_query_table = table_name
             # Mark this processing item as applied so that RuleProcessingItemAppliedCondition works
             self.processing_item_applied(rule)
         else:

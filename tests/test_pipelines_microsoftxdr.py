@@ -1093,6 +1093,237 @@ def test_microsoft_xdr_postprocessing_factory_pattern():
     assert item1.transformation is not item2.transformation
 
 
+# ─── Correlation rule tests ───────────────────────────────────────────────────
+
+
+def test_microsoft_xdr_correlation_single_rule_value_count():
+    """Single-rule value_count correlation: table is prepended by postprocessing."""
+    backend = KustoBackend(processing_pipeline=microsoft_xdr_pipeline())
+    yaml_rules = """
+title: Suspicious Process
+name: susp_process
+status: test
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    sel:
+        CommandLine: whoami
+    condition: sel
+---
+title: Multiple Suspicious Processes
+status: test
+correlation:
+    type: value_count
+    rules:
+        - susp_process
+    group-by:
+        - AccountName
+    timespan: 5m
+    condition:
+        gte: 10
+        field: AccountName
+"""
+    result = backend.convert(SigmaCollection.from_yaml(yaml_rules))
+    # Only the correlation query is returned (base rule is consumed)
+    assert len(result) == 1
+    query = result[0]
+    assert "DeviceProcessEvents" in query
+    assert 'ProcessCommandLine =~ "whoami"' in query
+    assert "summarize ValueCount = count_distinct(AccountName)" in query
+    assert "bin(TimeGenerated, 5m)" in query
+    assert "| where ValueCount >= 10" in query
+
+
+def test_microsoft_xdr_correlation_single_rule_value_avg():
+    """Single-rule value_avg correlation."""
+    backend = KustoBackend(processing_pipeline=microsoft_xdr_pipeline())
+    yaml_rules = """
+title: Suspicious Process
+name: susp_process
+status: test
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    sel:
+        CommandLine: mimikatz
+    condition: sel
+---
+title: High Avg
+status: test
+correlation:
+    type: value_avg
+    rules:
+        - susp_process
+    group-by:
+        - AccountName
+    timespan: 10m
+    condition:
+        gte: 5
+        field: AccountName
+"""
+    result = backend.convert(SigmaCollection.from_yaml(yaml_rules))
+    assert len(result) == 1
+    query = result[0]
+    assert "DeviceProcessEvents" in query
+    assert "summarize ValueAvg = avg(AccountName)" in query
+    assert "bin(TimeGenerated, 10m)" in query
+    assert "| where ValueAvg >= 5" in query
+
+
+def test_microsoft_xdr_correlation_single_rule_table_from_network_connection():
+    """Single-rule correlation where base rule targets DeviceNetworkEvents."""
+    backend = KustoBackend(processing_pipeline=microsoft_xdr_pipeline())
+    yaml_rules = """
+title: Suspicious Connection
+name: susp_conn
+status: test
+logsource:
+    category: network_connection
+    product: windows
+detection:
+    sel:
+        DestinationPort: 4444
+    condition: sel
+---
+title: Many Connections
+status: test
+correlation:
+    type: value_count
+    rules:
+        - susp_conn
+    group-by:
+        - AccountName
+    timespan: 5m
+    condition:
+        gte: 5
+        field: AccountName
+"""
+    result = backend.convert(SigmaCollection.from_yaml(yaml_rules))
+    assert len(result) == 1
+    query = result[0]
+    assert "DeviceNetworkEvents" in query
+    assert "summarize ValueCount" in query
+
+
+def test_microsoft_xdr_correlation_multi_rule_value_count():
+    """Multi-rule value_count correlation: each sub-query gets its own table prefix,
+    and the result is a union without a top-level table prefix."""
+    backend = KustoBackend(processing_pipeline=microsoft_xdr_pipeline())
+    yaml_rules = """
+title: Suspicious Process
+name: susp_process
+status: test
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    sel:
+        CommandLine: whoami
+    condition: sel
+---
+title: Suspicious File
+name: susp_file
+status: test
+logsource:
+    category: file_event
+    product: windows
+detection:
+    sel:
+        TargetFilename|endswith: .exe
+    condition: sel
+---
+title: Combined Suspicious Activity
+status: test
+correlation:
+    type: value_count
+    rules:
+        - susp_process
+        - susp_file
+    group-by:
+        - AccountName
+    timespan: 5m
+    condition:
+        gte: 10
+        field: AccountName
+"""
+    result = backend.convert(SigmaCollection.from_yaml(yaml_rules))
+    assert len(result) == 1
+    query = result[0]
+    assert query.startswith("union")
+    assert "DeviceProcessEvents" in query
+    assert "DeviceFileEvents" in query
+    assert 'ProcessCommandLine =~ "whoami"' in query
+    assert 'FolderPath endswith ".exe"' in query
+    assert "summarize ValueCount = count_distinct(AccountName)" in query
+    assert "bin(TimeGenerated, 5m)" in query
+    assert "| where ValueCount >= 10" in query
+
+
+def test_microsoft_xdr_correlation_multi_rule_three_tables():
+    """Multi-rule correlation spanning three different tables."""
+    backend = KustoBackend(processing_pipeline=microsoft_xdr_pipeline())
+    yaml_rules = """
+title: Suspicious Process
+name: susp_process
+status: test
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    sel:
+        CommandLine: whoami
+    condition: sel
+---
+title: Suspicious File
+name: susp_file
+status: test
+logsource:
+    category: file_event
+    product: windows
+detection:
+    sel:
+        TargetFilename|endswith: .ps1
+    condition: sel
+---
+title: Suspicious Connection
+name: susp_conn
+status: test
+logsource:
+    category: network_connection
+    product: windows
+detection:
+    sel:
+        DestinationPort: 4444
+    condition: sel
+---
+title: Multi-table Correlation
+status: test
+correlation:
+    type: value_count
+    rules:
+        - susp_process
+        - susp_file
+        - susp_conn
+    group-by:
+        - AccountName
+    timespan: 15m
+    condition:
+        gte: 3
+        field: AccountName
+"""
+    result = backend.convert(SigmaCollection.from_yaml(yaml_rules))
+    assert len(result) == 1
+    query = result[0]
+    assert query.startswith("union")
+    assert "DeviceProcessEvents" in query
+    assert "DeviceFileEvents" in query
+    assert "DeviceNetworkEvents" in query
+    assert "summarize ValueCount" in query
+    assert "| where ValueCount >= 3" in query
+
+
 def test_microsoft_xdr_pipeline_reuse_state_reset():
     """
     Test that pipeline state resets correctly across multiple rule conversions.

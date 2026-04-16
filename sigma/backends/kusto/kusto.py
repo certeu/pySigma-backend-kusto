@@ -175,9 +175,9 @@ class KustoBackend(TextQueryBackend):
     correlation_search_single_rule_expression: ClassVar[str] = "{query}"
 
     # Multiple referenced rules
-    correlation_search_multiple_rules_expression: ClassVar[str] = "union\n{query}"
-    correlation_search_multiple_rules_query_expression: ClassVar[str] = "(\n{query}\n)"
-    correlation_search_multiple_rules_query_expression_joiner: ClassVar[str] = ",\n"
+    correlation_search_multi_rule_expression: ClassVar[str] = "union\n{queries}"
+    correlation_search_multi_rule_query_expression: ClassVar[str] = "(\n{query}\n)"
+    correlation_search_multi_rule_query_expression_joiner: ClassVar[str] = ",\n"
 
     correlation_search_field_normalization_expression: ClassVar[str] = "| extend {alias} = {field}"
     correlation_search_field_normalization_expression_joiner: ClassVar[str] = "\n"
@@ -306,6 +306,31 @@ class KustoBackend(TextQueryBackend):
         # If we have a wildcard in a string, we need to un-escape it
         # See issue #13
         return re.sub(r"\\\*", r"*", converted)
+
+    def convert_correlation_search(self, rule: SigmaCorrelationRule, **kwargs) -> str:
+        """Override to include table names in multi-rule correlation sub-queries.
+        For single-rule correlation, delegates to the base class and lets postprocessing
+        prepend the table. For multi-rule correlation, each sub-query is self-contained
+        with its table name so no top-level prefix is needed.
+        """
+        if len(rule.referenced_rules) <= 1:
+            return super().convert_correlation_search(rule, **kwargs)
+
+        subquery_parts = []
+        for rule_ref in rule.referenced_rules:
+            base_rule = rule_ref.rule
+            queries = base_rule.get_conversion_result()
+            table = getattr(base_rule, "_kusto_query_table", None)
+            normalization = self.convert_correlation_search_field_normalization_expression(rule.aliases, rule_ref)
+            for query in queries:
+                full_query = query
+                if normalization:
+                    full_query = f"{full_query}\n{normalization}"
+                if table:
+                    full_query = f"{table}\n| where {full_query}"
+                subquery_parts.append(f"(\n{full_query}\n)")
+
+        return "union\n" + ",\n".join(subquery_parts)
 
     def _convert_correlation_value_rule(
         self,
