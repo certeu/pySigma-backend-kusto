@@ -55,6 +55,7 @@ The **pySigma Kusto Backend** transforms Sigma Rules into queries using [Kusto Q
 - **Pipelines**: Provides `microsoft_xdr_pipeline`, `sentinelasim_pipeline`, and `azure_monitor_pipeline` for query tables and field renames
 - **Output**: Query strings in Kusto Query Language (KQL)
 - **pySigma v1.0.0+**: Fully compatible with pySigma v1.0.0+ using factory pattern for pipeline objects
+- **Correlation Rules**: Supports Sigma correlation rules of type `value_count` and other `Value_*` types
 
 ### 🧑‍💻 Maintainer
 
@@ -236,6 +237,10 @@ Rules are supported if either:
 - A valid table name is supplied via the `query_table` parameter or YAML pipeline
 - The rule's logsource category is supported and mapped in the pipeline's `mappings.py` file
 - The rule has an `EventID` or `EventCode` field in the `detection` section, and the eventid is present in the pipeline's `eventid_to_table_mappings` dictionary
+
+#### Correlation Rule Support
+
+This backend supports Sigma [correlation rules](https://github.com/SigmaHQ/sigma-specification/blob/main/Sigma_meta_rules.md) of type `Value_*` (e.g., `value_count`). These are translated into KQL queries that aggregate event counts grouped by the specified fields.
 
 ### 🖥️ Commonly Supported Categories
 
