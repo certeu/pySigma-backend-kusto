@@ -1131,7 +1131,7 @@ correlation:
     assert "DeviceProcessEvents" in query
     assert 'ProcessCommandLine =~ "whoami"' in query
     assert "summarize ValueCount = count_distinct(AccountName)" in query
-    assert "bin(TimeGenerated, 5m)" in query
+    assert "bin(Timestamp, 5m)" in query
     assert "| where ValueCount >= 10" in query
 
 
@@ -1168,7 +1168,7 @@ correlation:
     query = result[0]
     assert "DeviceProcessEvents" in query
     assert "summarize ValueAvg = avg(AccountName)" in query
-    assert "bin(TimeGenerated, 10m)" in query
+    assert "bin(Timestamp, 10m)" in query
     assert "| where ValueAvg >= 5" in query
 
 
@@ -1205,7 +1205,7 @@ correlation:
     query = result[0]
     assert "DeviceProcessEvents" in query
     assert "summarize EventCount = count()" in query
-    assert "bin(TimeGenerated, 10m)" in query
+    assert "bin(Timestamp, 10m)" in query
     assert "| where EventCount >= 5" in query
 
 
@@ -1242,7 +1242,7 @@ correlation:
     query = result[0]
     assert "DeviceNetworkEvents" in query
     assert "summarize EventCount = count()" in query
-    assert "bin(TimeGenerated, 5m)" in query
+    assert "bin(Timestamp, 5m)" in query
     assert "| where EventCount >= 10" in query
 
 
@@ -1329,7 +1329,7 @@ correlation:
     assert "DeviceProcessEvents" in query
     assert "DeviceFileEvents" in query
     assert "summarize EventCount = count()" in query
-    assert "bin(TimeGenerated, 5m)" in query
+    assert "bin(Timestamp, 5m)" in query
     assert "| where EventCount >= 10" in query
 
 
@@ -1418,7 +1418,7 @@ correlation:
     assert 'ProcessCommandLine =~ "whoami"' in query
     assert 'FolderPath endswith ".exe"' in query
     assert "summarize ValueCount = count_distinct(AccountName)" in query
-    assert "bin(TimeGenerated, 5m)" in query
+    assert "bin(Timestamp, 5m)" in query
     assert "| where ValueCount >= 10" in query
 
 
