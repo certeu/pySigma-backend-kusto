@@ -240,7 +240,7 @@ Rules are supported if either:
 
 #### Correlation Rule Support
 
-This backend supports Sigma [correlation rules](https://github.com/SigmaHQ/sigma-specification/blob/main/specification/sigma-correlation-rules-specification.md#correlation-types) of type `Value_*` (e.g., `value_count`). These are translated into KQL queries that aggregate event counts grouped by the specified fields.
+This backend supports Sigma [correlation rules](https://github.com/SigmaHQ/sigma-specification/blob/main/specification/sigma-correlation-rules-specification.md#correlation-types) of type `Value_*` (e.g., `value_count`) and `Event_count`. These are translated into KQL queries that aggregate event counts grouped by the specified fields.
 
 ### 🖥️ Commonly Supported Categories
 
