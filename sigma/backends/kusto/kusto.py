@@ -1,16 +1,11 @@
 import re
-from typing import ClassVar, Dict, Pattern, Tuple, Type, Union
+from typing import ClassVar, Dict, Optional, Pattern, Tuple, Type, Union
 
-from sigma.conditions import (
-    ConditionAND,
-    ConditionFieldEqualsValueExpression,
-    ConditionItem,
-    ConditionNOT,
-    ConditionOR,
-)
+from sigma.conditions import ConditionAND, ConditionFieldEqualsValueExpression, ConditionItem, ConditionNOT, ConditionOR
 from sigma.conversion.base import TextQueryBackend
 from sigma.conversion.deferred import DeferredQueryExpression
 from sigma.conversion.state import ConversionState
+from sigma.correlations import SigmaCorrelationConditionOperator, SigmaCorrelationRule
 from sigma.types import SigmaCompareExpression, SigmaNumber, SigmaString, SpecialChars
 
 
@@ -161,6 +156,61 @@ class KustoBackend(TextQueryBackend):
     # to use it
     num_eq_token: ClassVar[str] = " == "
 
+    timespan_mapping: ClassVar[Dict[str, str]] = {
+        "s": "s",
+        "m": "min",
+        "h": "h",
+        "d": "d",
+    }
+
+    # Correlation support
+
+    correlation_methods: ClassVar[Dict[str, str]] = {
+        "default": "Summarize with bin() - clock-aligned time buckets",
+    }
+    default_correlation_method: ClassVar[str] = "default"
+
+    default_correlation_query: ClassVar[str] = {"default": "{search}\n{aggregate}\n{condition}"}
+
+    correlation_search_single_rule_expression: ClassVar[str] = "{query}"
+
+    # Multiple referenced rules
+    correlation_search_multi_rule_expression: ClassVar[str] = "union\n{queries}"
+    correlation_search_multi_rule_query_expression: ClassVar[str] = "(\n{query}\n)"
+    correlation_search_multi_rule_query_expression_joiner: ClassVar[str] = ",\n"
+
+    correlation_search_field_normalization_expression: ClassVar[str] = "| extend {alias} = {field}"
+    correlation_search_field_normalization_expression_joiner: ClassVar[str] = "\n"
+
+    # value_count correlation
+
+    value_count_aggregation_expression: ClassVar[Dict[str, str]] = {
+        "default": "| summarize ValueCount = count_distinct({field}) by bin(TimeGenerated, {timespan}){groupby}"
+    }
+
+    value_count_condition_expression: ClassVar[Dict[str, str]] = {"default": "| where ValueCount {op} {count}"}
+
+    value_avg_aggregation_expression: ClassVar[Dict[str, str]] = {
+        "default": "| summarize ValueAvg = avg({field}) by bin(TimeGenerated, {timespan}){groupby}"
+    }
+    value_avg_condition_expression: ClassVar[Dict[str, str]] = {"default": "| where ValueAvg {op} {count}"}
+
+    value_median_aggregation_expression: ClassVar[Dict[str, str]] = {
+        "default": "| summarize ValueMedian = percentile({field}, 50) by bin(TimeGenerated, {timespan}){groupby}"
+    }
+
+    value_median_condition_expression: ClassVar[Dict[str, str]] = {"default": "| where ValueMedian {op} {count}"}
+
+    value_sum_aggregation_expression: ClassVar[Dict[str, str]] = {
+        "default": "| summarize ValueSum = sum({field}) by bin(TimeGenerated, {timespan}){groupby}"
+    }
+
+    value_sum_condition_expression: ClassVar[Dict[str, str]] = {"default": "| where ValueSum {op} {count}"}
+
+    value_percentile_aggregation_expression: ClassVar[Dict[str, str]] = {
+        "default": "| summarize ValuePercentile = percentile({field}, {percentile}) by bin(TimeGenerated, {timespan}){groupby}"
+    }
+
     # Override methods
 
     #  For numeric values, need == instead of =~
@@ -256,3 +306,119 @@ class KustoBackend(TextQueryBackend):
         # If we have a wildcard in a string, we need to un-escape it
         # See issue #13
         return re.sub(r"\\\*", r"*", converted)
+
+    def convert_correlation_search(self, rule: SigmaCorrelationRule, **kwargs) -> str:
+        """Override to include table names in multi-rule correlation sub-queries.
+        For single-rule correlation, delegates to the base class and lets postprocessing
+        prepend the table. For multi-rule correlation, each sub-query is self-contained
+        with its table name so no top-level prefix is needed.
+        """
+        if len(rule.referenced_rules) <= 1:
+            return super().convert_correlation_search(rule, **kwargs)
+
+        subquery_parts = []
+        for rule_ref in rule.referenced_rules:
+            base_rule = rule_ref.rule
+            queries = base_rule.get_conversion_result()
+            table = getattr(base_rule, "_kusto_query_table", None)
+            normalization = self.convert_correlation_search_field_normalization_expression(rule.aliases, rule_ref)
+            for query in queries:
+                full_query = query
+                if normalization:
+                    full_query = f"{full_query}\n{normalization}"
+                if table:
+                    full_query = f"{table}\n| where {full_query}"
+                subquery_parts.append(f"(\n{full_query}\n)")
+
+        return "union\n" + ",\n".join(subquery_parts)
+
+    def _convert_correlation_value_rule(
+        self,
+        rule: SigmaCorrelationRule,
+        aggregation_expressions: Dict[str, str],
+        condition_expressions: Dict[str, str],
+        output_format: Optional[str] = None,
+        method: str = "default",
+    ) -> list[str]:
+        search = self.convert_correlation_search(rule, output_format=output_format)
+        groupby = (", " + ", ".join(rule.group_by)) if rule.group_by else ""
+        timespan = self._correlation_timespan_to_kql(rule.timespan)
+        aggregate = aggregation_expressions[method].format(
+            field=rule.condition.fieldref,
+            timespan=timespan,
+            groupby=groupby,
+        )
+        op_map = {
+            SigmaCorrelationConditionOperator.GT: ">",
+            SigmaCorrelationConditionOperator.GTE: ">=",
+            SigmaCorrelationConditionOperator.LT: "<",
+            SigmaCorrelationConditionOperator.LTE: "<=",
+            SigmaCorrelationConditionOperator.EQ: "==",
+        }
+        op = op_map[rule.condition.op]
+        condition = condition_expressions[method].format(op=op, count=rule.condition.count)
+        query = self.default_correlation_query[method].format(search=search, aggregate=aggregate, condition=condition)
+        return [query]
+
+    def convert_correlation_value_count_rule(
+        self, rule: SigmaCorrelationRule, output_format: Optional[str] = None, method: str = "default"
+    ) -> list[str]:
+        return self._convert_correlation_value_rule(
+            rule, self.value_count_aggregation_expression, self.value_count_condition_expression, output_format, method
+        )
+
+    def convert_correlation_value_avg_rule(
+        self, rule: SigmaCorrelationRule, output_format: Optional[str] = None, method: str = "default"
+    ) -> list[str]:
+        return self._convert_correlation_value_rule(
+            rule, self.value_avg_aggregation_expression, self.value_avg_condition_expression, output_format, method
+        )
+
+    def convert_correlation_value_median_rule(
+        self, rule: SigmaCorrelationRule, output_format: Optional[str] = None, method: str = "default"
+    ) -> list[str]:
+        return self._convert_correlation_value_rule(
+            rule,
+            self.value_median_aggregation_expression,
+            self.value_median_condition_expression,
+            output_format,
+            method,
+        )
+
+    def convert_correlation_value_sum_rule(
+        self, rule: SigmaCorrelationRule, output_format: Optional[str] = None, method: str = "default"
+    ) -> list[str]:
+        return self._convert_correlation_value_rule(
+            rule, self.value_sum_aggregation_expression, self.value_sum_condition_expression, output_format, method
+        )
+
+    def convert_correlation_value_percentile_rule(
+        self, rule: SigmaCorrelationRule, output_format: Optional[str] = None, method: str = "default"
+    ) -> list[str]:
+        if not hasattr(rule.condition, "percentile"):
+            raise ValueError("Percentile value must be specified in condition for value_percentile correlation rules.")
+        search = self.convert_correlation_search(rule, output_format=output_format)
+        groupby = (", " + ", ".join(rule.group_by)) if rule.group_by else ""
+        timespan = self._correlation_timespan_to_kql(rule.timespan)
+        aggregate = self.value_percentile_aggregation_expression[method].format(
+            field=rule.condition.fieldref,
+            timespan=timespan,
+            groupby=groupby,
+            percentile=rule.condition.count,
+        )
+        query = self.default_correlation_query[method].format(search=search, aggregate=aggregate, condition=None)
+        return [query]
+
+    def _correlation_timespan_to_kql(self, timespan: object) -> str:
+        """Convert SigmaCorrelationTimespan into valid KQL timespan literal."""
+        spec = getattr(timespan, "spec", None)
+        if isinstance(spec, str) and spec:
+            return spec
+
+        count = getattr(timespan, "count", None)
+        unit = getattr(timespan, "unit", None)
+        if isinstance(count, int) and count > 0 and isinstance(unit, str):
+            mapped_unit = self.timespan_mapping.get(unit, unit)
+            return f"{count}{mapped_unit}"
+
+        return str(timespan)
