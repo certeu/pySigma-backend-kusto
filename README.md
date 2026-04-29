@@ -196,7 +196,7 @@ transformations:
     val: "TimeGenerated"   # or "Timestamp" for XDR
 ```
 
-If no `timestamp_field` is set by any pipeline, the backend falls back to `TimeStamp`.
+If no `timestamp_field` is set by any pipeline, the backend falls back to `Timestamp`.
 
 ### 🗃️ Custom Table Names (New in 0.3.0) (Beta)
 
