@@ -55,7 +55,7 @@ The **pySigma Kusto Backend** transforms Sigma Rules into queries using [Kusto Q
 - **Pipelines**: Provides `microsoft_xdr_pipeline`, `sentinelasim_pipeline`, and `azure_monitor_pipeline` for query tables and field renames
 - **Output**: Query strings in Kusto Query Language (KQL)
 - **pySigma v1.0.0+**: Fully compatible with pySigma v1.0.0+ using factory pattern for pipeline objects
-- **Correlation Rules**: Supports Sigma correlation rules of type `value_count` and other `Value_*` types
+- **Correlation Rules**: Supports all Sigma correlation rules
 
 ### 🧑‍💻 Maintainer
 
@@ -261,7 +261,20 @@ Rules are supported if either:
 
 #### Correlation Rule Support
 
-This backend supports Sigma [correlation rules](https://github.com/SigmaHQ/sigma-specification/blob/main/specification/sigma-correlation-rules-specification.md#correlation-types) of type `Value_*` (e.g., `value_count`) and `Event_count`. These are translated into KQL queries that aggregate event counts grouped by the specified fields.
+This backend supports all Sigma [correlation rules](https://github.com/SigmaHQ/sigma-specification/blob/main/specification/sigma-correlation-rules-specification.md#correlation-types):
+
+| Correlation type | KQL aggregation |
+|---|---|
+| `event_count` | `summarize EventCount = count() by bin(<timestamp>, <timespan>)` |
+| `value_count` | `summarize ValueCount = count_distinct(<field>) by bin(<timestamp>, <timespan>)` |
+| `value_avg` | `summarize ValueAvg = avg(<field>) by bin(<timestamp>, <timespan>)` |
+| `value_median` | `summarize ValueMedian = percentile(<field>, 50) by bin(<timestamp>, <timespan>)` |
+| `value_sum` | `summarize ValueSum = sum(<field>) by bin(<timestamp>, <timespan>)` |
+| `value_percentile` | `summarize ValuePercentile = percentile(<field>, <p>) by bin(<timestamp>, <timespan>)` |
+| `temporal` | `summarize TemporalCount = count_distinct(EventType) by bin(<timestamp>, <timespan>)` |
+| `temporal_ordered` | `summarize TemporalCount = count_distinct(EventType), <order_aggs> by bin(<timestamp>, <timespan>)` |
+
+Multi-rule correlations union the referenced sub-queries with `union`. The timestamp field used in `bin()` is set automatically by each pipeline (see [Custom Timestamp Field](#️-custom-timestamp-field) above).
 
 ### 🖥️ Commonly Supported Categories
 
