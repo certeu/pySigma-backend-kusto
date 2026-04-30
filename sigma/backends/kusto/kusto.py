@@ -156,6 +156,8 @@ class KustoBackend(TextQueryBackend):
     # to use it
     num_eq_token: ClassVar[str] = " == "
 
+    timestamp_field: ClassVar[str] = "Timestamp"  # Default timestamp field name, can be overridden by pipeline state
+
     timespan_mapping: ClassVar[Dict[str, str]] = {
         "s": "s",
         "m": "min",
@@ -183,33 +185,42 @@ class KustoBackend(TextQueryBackend):
     correlation_search_field_normalization_expression_joiner: ClassVar[str] = "\n"
 
     # value_count correlation
-
     value_count_aggregation_expression: ClassVar[Dict[str, str]] = {
-        "default": "| summarize ValueCount = count_distinct({field}) by bin(TimeGenerated, {timespan}){groupby}"
+        "default": "| summarize ValueCount = count_distinct({field}) by bin({timestamp}, {timespan}){groupby}"
     }
 
     value_count_condition_expression: ClassVar[Dict[str, str]] = {"default": "| where ValueCount {op} {count}"}
 
+    # value_avg correlation
     value_avg_aggregation_expression: ClassVar[Dict[str, str]] = {
-        "default": "| summarize ValueAvg = avg({field}) by bin(TimeGenerated, {timespan}){groupby}"
+        "default": "| summarize ValueAvg = avg({field}) by bin({timestamp}, {timespan}){groupby}"
     }
     value_avg_condition_expression: ClassVar[Dict[str, str]] = {"default": "| where ValueAvg {op} {count}"}
 
+    # value_median correlation
     value_median_aggregation_expression: ClassVar[Dict[str, str]] = {
-        "default": "| summarize ValueMedian = percentile({field}, 50) by bin(TimeGenerated, {timespan}){groupby}"
+        "default": "| summarize ValueMedian = percentile({field}, 50) by bin({timestamp}, {timespan}){groupby}"
     }
 
     value_median_condition_expression: ClassVar[Dict[str, str]] = {"default": "| where ValueMedian {op} {count}"}
 
+    # value_sum correlation
     value_sum_aggregation_expression: ClassVar[Dict[str, str]] = {
-        "default": "| summarize ValueSum = sum({field}) by bin(TimeGenerated, {timespan}){groupby}"
+        "default": "| summarize ValueSum = sum({field}) by bin({timestamp}, {timespan}){groupby}"
     }
 
     value_sum_condition_expression: ClassVar[Dict[str, str]] = {"default": "| where ValueSum {op} {count}"}
 
+    # value_percentile correlation
     value_percentile_aggregation_expression: ClassVar[Dict[str, str]] = {
-        "default": "| summarize ValuePercentile = percentile({field}, {percentile}) by bin(TimeGenerated, {timespan}){groupby}"
+        "default": "| summarize ValuePercentile = percentile({field}, {percentile}) by bin({timestamp}, {timespan}){groupby}"
     }
+
+    # event_count correlation
+    event_count_aggregation_expression: ClassVar[Dict[str, str]] = {
+        "default": "| summarize EventCount = count() by bin({timestamp}, {timespan}){groupby}"
+    }
+    event_count_condition_expression: ClassVar[Dict[str, str]] = {"default": "| where EventCount {op} {count}"}
 
     # Override methods
 
@@ -332,6 +343,13 @@ class KustoBackend(TextQueryBackend):
 
         return "union\n" + ",\n".join(subquery_parts)
 
+    def _get_timestamp_field(self) -> str:
+        """Return the timestamp field name, preferring any value set by the active pipeline."""
+        pipeline = getattr(self, "last_processing_pipeline", None)
+        if pipeline is not None:
+            return pipeline.state.get("timestamp_field", self.timestamp_field)
+        return self.timestamp_field
+
     def _convert_correlation_value_rule(
         self,
         rule: SigmaCorrelationRule,
@@ -347,6 +365,7 @@ class KustoBackend(TextQueryBackend):
             field=rule.condition.fieldref,
             timespan=timespan,
             groupby=groupby,
+            timestamp=self._get_timestamp_field(),
         )
         op_map = {
             SigmaCorrelationConditionOperator.GT: ">",
@@ -405,9 +424,17 @@ class KustoBackend(TextQueryBackend):
             timespan=timespan,
             groupby=groupby,
             percentile=rule.condition.count,
+            timestamp=self._get_timestamp_field(),
         )
         query = self.default_correlation_query[method].format(search=search, aggregate=aggregate, condition=None)
         return [query]
+
+    def convert_correlation_event_count_rule(
+        self, rule: SigmaCorrelationRule, output_format: Optional[str] = None, method: str = "default"
+    ) -> list[str]:
+        return self._convert_correlation_value_rule(
+            rule, self.event_count_aggregation_expression, self.event_count_condition_expression, output_format, method
+        )
 
     def _correlation_timespan_to_kql(self, timespan: object) -> str:
         """Convert SigmaCorrelationTimespan into valid KQL timespan literal."""

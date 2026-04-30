@@ -177,6 +177,27 @@ pipeline = microsoft_xdr_pipeline(transform_parent_image=False)
 
 This argument allows fine-tuning of the ParentImage field mapping, which can be crucial for accurate rule conversion in certain scenarios. By default, it follows the behavior of mapping ParentImage to the parent process name, but setting it to `False` allows for mapping to the initiating process name instead.
 
+### ⏱️ Custom Timestamp Field
+
+Correlation rules use `bin(<timestamp_field>, <timespan>)` in their aggregation expressions. The timestamp field name differs depending on the target platform:
+
+| Pipeline | Timestamp field |
+|---|---|
+| `microsoft_xdr` | `Timestamp` |
+| `sentinelasim`, `azure_monitor`, none | `TimeGenerated` |
+
+This is set automatically when using the built-in pipelines. If you write a **custom YAML pipeline**, add a `set_state` transformation to declare the correct field:
+
+```yaml
+transformations:
+  - id: set_timestamp_field
+    type: set_state
+    key: timestamp_field
+    val: "TimeGenerated"   # or "Timestamp" for XDR
+```
+
+If no `timestamp_field` is set by any pipeline, the backend falls back to `Timestamp`.
+
 ### 🗃️ Custom Table Names (New in 0.3.0) (Beta)
 
 The `query_table` argument allows users to override table mappings and set custom table names.  This is useful for converting Sigma rules where the rule category does not easily map to the default table names.
@@ -240,7 +261,7 @@ Rules are supported if either:
 
 #### Correlation Rule Support
 
-This backend supports Sigma [correlation rules](https://github.com/SigmaHQ/sigma-specification/blob/main/specification/sigma-correlation-rules-specification.md#correlation-types) of type `Value_*` (e.g., `value_count`). These are translated into KQL queries that aggregate event counts grouped by the specified fields.
+This backend supports Sigma [correlation rules](https://github.com/SigmaHQ/sigma-specification/blob/main/specification/sigma-correlation-rules-specification.md#correlation-types) of type `Value_*` (e.g., `value_count`) and `Event_count`. These are translated into KQL queries that aggregate event counts grouped by the specified fields.
 
 ### 🖥️ Commonly Supported Categories
 

@@ -1131,7 +1131,7 @@ correlation:
     assert "DeviceProcessEvents" in query
     assert 'ProcessCommandLine =~ "whoami"' in query
     assert "summarize ValueCount = count_distinct(AccountName)" in query
-    assert "bin(TimeGenerated, 5m)" in query
+    assert "bin(Timestamp, 5m)" in query
     assert "| where ValueCount >= 10" in query
 
 
@@ -1168,8 +1168,169 @@ correlation:
     query = result[0]
     assert "DeviceProcessEvents" in query
     assert "summarize ValueAvg = avg(AccountName)" in query
-    assert "bin(TimeGenerated, 10m)" in query
+    assert "bin(Timestamp, 10m)" in query
     assert "| where ValueAvg >= 5" in query
+
+
+def test_microsoft_xdr_correlation_single_rule_event_count():
+    """Single-rule event_count correlation."""
+    backend = KustoBackend(processing_pipeline=microsoft_xdr_pipeline())
+    yaml_rules = """
+title: Suspicious Process
+name: susp_process
+status: test
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    sel:
+        CommandLine: mimikatz
+    condition: sel
+---
+title: High Event Count
+status: test
+correlation:
+    type: event_count
+    rules:
+        - susp_process
+    group-by:
+        - AccountName
+    timespan: 10m
+    condition:
+        gte: 5
+        field: AccountName
+"""
+    result = backend.convert(SigmaCollection.from_yaml(yaml_rules))
+    assert len(result) == 1
+    query = result[0]
+    assert "DeviceProcessEvents" in query
+    assert "summarize EventCount = count()" in query
+    assert "bin(Timestamp, 10m)" in query
+    assert "| where EventCount >= 5" in query
+
+
+def test_microsoft_xdr_correlation_event_count_different_table():
+    """event_count correlation where base rule targets DeviceNetworkEvents."""
+    backend = KustoBackend(processing_pipeline=microsoft_xdr_pipeline())
+    yaml_rules = """
+title: Suspicious Connection
+name: susp_conn
+status: test
+logsource:
+    category: network_connection
+    product: windows
+detection:
+    sel:
+        DestinationPort: 4444
+    condition: sel
+---
+title: Many Connections
+status: test
+correlation:
+    type: event_count
+    rules:
+        - susp_conn
+    group-by:
+        - AccountName
+    timespan: 5m
+    condition:
+        gte: 10
+        field: AccountName
+"""
+    result = backend.convert(SigmaCollection.from_yaml(yaml_rules))
+    assert len(result) == 1
+    query = result[0]
+    assert "DeviceNetworkEvents" in query
+    assert "summarize EventCount = count()" in query
+    assert "bin(Timestamp, 5m)" in query
+    assert "| where EventCount >= 10" in query
+
+
+def test_microsoft_xdr_correlation_event_count_lte_operator():
+    """event_count correlation using a lte threshold operator."""
+    backend = KustoBackend(processing_pipeline=microsoft_xdr_pipeline())
+    yaml_rules = """
+title: Suspicious Process
+name: susp_process
+status: test
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    sel:
+        CommandLine: mimikatz
+    condition: sel
+---
+title: Low Event Count
+status: test
+correlation:
+    type: event_count
+    rules:
+        - susp_process
+    group-by:
+        - AccountName
+    timespan: 10m
+    condition:
+        lte: 3
+        field: AccountName
+"""
+    result = backend.convert(SigmaCollection.from_yaml(yaml_rules))
+    assert len(result) == 1
+    query = result[0]
+    assert "DeviceProcessEvents" in query
+    assert "summarize EventCount = count()" in query
+    assert "| where EventCount <= 3" in query
+
+
+def test_microsoft_xdr_correlation_multi_rule_event_count():
+    """Multi-rule event_count correlation: sub-queries are unioned."""
+    backend = KustoBackend(processing_pipeline=microsoft_xdr_pipeline())
+    yaml_rules = """
+title: Suspicious Process
+name: susp_process
+status: test
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    sel:
+        CommandLine: whoami
+    condition: sel
+---
+title: Suspicious File
+name: susp_file
+status: test
+logsource:
+    category: file_event
+    product: windows
+detection:
+    sel:
+        TargetFilename|endswith: .exe
+    condition: sel
+---
+title: Combined Event Count
+status: test
+correlation:
+    type: event_count
+    rules:
+        - susp_process
+        - susp_file
+    group-by:
+        - AccountName
+    timespan: 5m
+    condition:
+        gte: 10
+        field: AccountName
+"""
+    result = backend.convert(SigmaCollection.from_yaml(yaml_rules))
+    assert len(result) == 1
+    query = result[0]
+    assert query.startswith("union")
+    assert "DeviceProcessEvents" in query
+    assert "DeviceFileEvents" in query
+    assert "summarize EventCount = count()" in query
+    assert "bin(Timestamp, 5m)" in query
+    assert "| where EventCount >= 10" in query
 
 
 def test_microsoft_xdr_correlation_single_rule_table_from_network_connection():
@@ -1257,7 +1418,7 @@ correlation:
     assert 'ProcessCommandLine =~ "whoami"' in query
     assert 'FolderPath endswith ".exe"' in query
     assert "summarize ValueCount = count_distinct(AccountName)" in query
-    assert "bin(TimeGenerated, 5m)" in query
+    assert "bin(Timestamp, 5m)" in query
     assert "| where ValueCount >= 10" in query
 
 
