@@ -1549,3 +1549,105 @@ detection:
     assert "test.exe" in results[2]
     assert "DeviceProcessEvents" in results[3]
     assert "cmd.exe" in results[3]
+
+
+def test_microsoft_xdr_correlation_multi_rule_temporal():
+    """Multi-rule temporal correlation: each sub-query is tagged with its rule ID and
+    TemporalCount uses count_distinct(EventType) to detect distinct event types co-occurring."""
+    backend = KustoBackend(processing_pipeline=microsoft_xdr_pipeline())
+    yaml_rules = """
+title: Suspicious Connection
+name: susp_conn
+status: test
+logsource:
+    category: network_connection
+    product: windows
+detection:
+    sel:
+        DestinationPort: 4444
+    condition: sel
+---
+title: Suspicious Process
+name: susp_proc
+status: test
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    sel:
+        Image|endswith: powershell.exe
+    condition: sel
+---
+title: Exploit Chain
+status: test
+correlation:
+    type: temporal
+    rules:
+        - susp_conn
+        - susp_proc
+    group-by:
+        - AccountName
+    timespan: 10s
+    condition:
+        gte: 2
+"""
+    result = backend.convert(SigmaCollection.from_yaml(yaml_rules))
+    assert len(result) == 1
+    query = result[0]
+    assert query.startswith("union")
+    assert "DeviceNetworkEvents" in query
+    assert "DeviceProcessEvents" in query
+    # Each sub-query must be tagged with its rule name
+    assert '| extend EventType = "susp_conn"' in query
+    assert '| extend EventType = "susp_proc"' in query
+    # Aggregation must count distinct event types, not total events
+    assert "summarize TemporalCount = count_distinct(EventType)" in query
+    assert "bin(Timestamp, 10s)" in query
+    assert ", AccountName" in query
+    assert "| where TemporalCount >= 2" in query
+
+
+def test_microsoft_xdr_correlation_temporal_without_groupby():
+    """Temporal correlation with no group-by clause."""
+    backend = KustoBackend(processing_pipeline=microsoft_xdr_pipeline())
+    yaml_rules = """
+title: Brute Force
+name: brute_force
+status: test
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    sel:
+        CommandLine|contains: failed
+    condition: sel
+---
+title: Successful Logon
+name: succ_logon
+status: test
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    sel:
+        CommandLine|contains: success
+    condition: sel
+---
+title: Brute Force Success
+status: test
+correlation:
+    type: temporal
+    rules:
+        - brute_force
+        - succ_logon
+    timespan: 5m
+    condition:
+        gte: 2
+"""
+    result = backend.convert(SigmaCollection.from_yaml(yaml_rules))
+    assert len(result) == 1
+    query = result[0]
+    assert "summarize TemporalCount = count_distinct(EventType) by bin(Timestamp, 5m)" in query
+    assert "| where TemporalCount >= 2" in query
+    # No trailing group-by fields
+    assert "AccountName" not in query
