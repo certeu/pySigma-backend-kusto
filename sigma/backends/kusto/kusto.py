@@ -222,9 +222,129 @@ class KustoBackend(TextQueryBackend):
     }
     event_count_condition_expression: ClassVar[Dict[str, str]] = {"default": "| where EventCount {op} {count}"}
 
+    # temporal correlation
+    temporal_aggregation_expression: ClassVar[Dict[str, str]] = {
+        "default": "| summarize TemporalCount = count_distinct(EventType) by bin({timestamp}, {timespan}){groupby}"
+    }
+    temporal_condition_expression: ClassVar[Dict[str, str]] = {"default": "| where TemporalCount {op} {count}"}
+
+    # temporal_ordered correlation
+    temporal_ordered_aggregation_expression: ClassVar[Dict[str, str]] = {
+        "default": "| summarize TemporalCount = count_distinct(EventType), {order_aggs} by bin({timestamp}, {timespan}){groupby}"
+    }
+
     # Override methods
 
     #  For numeric values, need == instead of =~
+    def convert_correlation_temporal_rule(
+        self, rule: SigmaCorrelationRule, output_format: Optional[str] = None, method: str = "default"
+    ) -> list[str]:
+        """Override for temporal correlation.
+
+        Tags each referenced-rule sub-query with its rule ID via ``| extend EventType``,
+        unions them, then counts *distinct* event types per time bucket.  This matches the
+        intended semantics: detect multiple different event types occurring close together
+        in time (e.g. failed logon followed by successful logon from the same source).
+        """
+        subquery_parts = []
+        for rule_ref in rule.referenced_rules:
+            base_rule = rule_ref.rule
+            rule_id = str(base_rule.name or base_rule.id)
+            table = getattr(base_rule, "_kusto_query_table", None)
+            normalization = self.convert_correlation_search_field_normalization_expression(rule.aliases, rule_ref)
+            for query in base_rule.get_conversion_result():
+                full_query = query
+                if normalization:
+                    full_query = f"{full_query}\n{normalization}"
+                if table:
+                    full_query = f"{table}\n| where {full_query}"
+                full_query = f'{full_query}\n| extend EventType = "{rule_id}"'
+                subquery_parts.append(f"(\n{full_query}\n)")
+
+        search = "union\n" + ",\n".join(subquery_parts)
+
+        groupby = (", " + ", ".join(rule.group_by)) if rule.group_by else ""
+        timespan = self._correlation_timespan_to_kql(rule.timespan)
+        timestamp = self._get_timestamp_field()
+
+        aggregate = self.temporal_aggregation_expression[method].format(
+            timespan=timespan,
+            groupby=groupby,
+            timestamp=timestamp,
+        )
+
+        op_map = {
+            SigmaCorrelationConditionOperator.GT: ">",
+            SigmaCorrelationConditionOperator.GTE: ">=",
+            SigmaCorrelationConditionOperator.LT: "<",
+            SigmaCorrelationConditionOperator.LTE: "<=",
+            SigmaCorrelationConditionOperator.EQ: "==",
+        }
+        op = op_map[rule.condition.op]
+        condition = self.temporal_condition_expression[method].format(op=op, count=rule.condition.count)
+
+        return [f"{search}\n{aggregate}\n{condition}"]
+
+    def convert_correlation_temporal_ordered_rule(
+        self, rule: SigmaCorrelationRule, output_format: Optional[str] = None, method: str = "default"
+    ) -> list[str]:
+        """Override for ordered temporal correlation.
+
+        Like the temporal correlation but adds an order check: each referenced rule's
+        sub-query is tagged with both ``EventType`` and a 1-based ``EventOrder`` integer.
+        The summarize step uses ``minif(Timestamp, EventOrder == N)`` to capture the
+        first occurrence of each event type, and the condition appends
+        ``FirstTs1 < FirstTs2 and FirstTs2 < FirstTs3 ...`` so that the events must
+        have appeared in the declared rule order within the time window.
+        """
+        subquery_parts = []
+        n_rules = len(rule.referenced_rules)
+        for idx, rule_ref in enumerate(rule.referenced_rules, start=1):
+            base_rule = rule_ref.rule
+            rule_id = str(base_rule.name or base_rule.id)
+            table = getattr(base_rule, "_kusto_query_table", None)
+            normalization = self.convert_correlation_search_field_normalization_expression(rule.aliases, rule_ref)
+            for query in base_rule.get_conversion_result():
+                full_query = query
+                if normalization:
+                    full_query = f"{full_query}\n{normalization}"
+                if table:
+                    full_query = f"{table}\n| where {full_query}"
+                full_query = f'{full_query}\n| extend EventType = "{rule_id}", EventOrder = {idx}'
+                subquery_parts.append(f"(\n{full_query}\n)")
+
+        search = "union\n" + ",\n".join(subquery_parts)
+
+        groupby = (", " + ", ".join(rule.group_by)) if rule.group_by else ""
+        timespan = self._correlation_timespan_to_kql(rule.timespan)
+        timestamp = self._get_timestamp_field()
+
+        op_map = {
+            SigmaCorrelationConditionOperator.GT: ">",
+            SigmaCorrelationConditionOperator.GTE: ">=",
+            SigmaCorrelationConditionOperator.LT: "<",
+            SigmaCorrelationConditionOperator.LTE: "<=",
+            SigmaCorrelationConditionOperator.EQ: "==",
+        }
+        op = op_map[rule.condition.op]
+
+        # Build per-rule minif aggregations: FirstTs1 = minif(Timestamp, EventOrder == 1), ...
+        order_aggs = ", ".join(f"FirstTs{i} = minif({timestamp}, EventOrder == {i})" for i in range(1, n_rules + 1))
+        aggregate = self.temporal_ordered_aggregation_expression[method].format(
+            order_aggs=order_aggs,
+            timespan=timespan,
+            groupby=groupby,
+            timestamp=timestamp,
+        )
+
+        # Build ordering constraint: FirstTs1 < FirstTs2 and FirstTs2 < FirstTs3 ...
+        order_conditions = " and ".join(f"FirstTs{i} < FirstTs{i + 1}" for i in range(1, n_rules))
+        condition = self.temporal_condition_expression[method].format(op=op, count=rule.condition.count)
+        if order_conditions:
+            condition += f" and {order_conditions}"
+
+        return [f"{search}\n{aggregate}\n{condition}"]
+
     def convert_condition_field_eq_val_num(
         self, cond: ConditionFieldEqualsValueExpression, state: ConversionState
     ) -> Union[str, DeferredQueryExpression]:
