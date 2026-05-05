@@ -1,4 +1,5 @@
 import re
+from collections import Counter
 from typing import ClassVar, Dict, Optional, Pattern, Tuple, Type, Union
 
 from sigma.conditions import ConditionAND, ConditionFieldEqualsValueExpression, ConditionItem, ConditionNOT, ConditionOR
@@ -250,12 +251,15 @@ class KustoBackend(TextQueryBackend):
         for rule_ref in rule.referenced_rules:
             base_rule = rule_ref.rule
             rule_id = str(base_rule.name or base_rule.id)
-            table = getattr(base_rule, "_kusto_query_table", None)
+            table = self._get_rule_table(base_rule)
             normalization = self.convert_correlation_search_field_normalization_expression(rule.aliases, rule_ref)
+            auto_norm = self._build_groupby_normalization(rule, rule_ref)
             for query in base_rule.get_conversion_result():
                 full_query = query
                 if normalization:
                     full_query = f"{full_query}\n{normalization}"
+                if auto_norm:
+                    full_query = f"{full_query}\n{auto_norm}"
                 if table:
                     full_query = f"{table}\n| where {full_query}"
                 full_query = f'{full_query}\n| extend EventType = "{rule_id}"'
@@ -263,7 +267,9 @@ class KustoBackend(TextQueryBackend):
 
         search = "union\n" + ",\n".join(subquery_parts)
 
-        groupby = (", " + ", ".join(rule.group_by)) if rule.group_by else ""
+        # Resolve group-by field names to the canonical (most-common) KQL column name
+        groupby_fields = self._resolve_groupby_fields(rule)
+        groupby = (", " + ", ".join(groupby_fields)) if groupby_fields else ""
         timespan = self._correlation_timespan_to_kql(rule.timespan)
         timestamp = self._get_timestamp_field()
 
@@ -302,12 +308,15 @@ class KustoBackend(TextQueryBackend):
         for idx, rule_ref in enumerate(rule.referenced_rules, start=1):
             base_rule = rule_ref.rule
             rule_id = str(base_rule.name or base_rule.id)
-            table = getattr(base_rule, "_kusto_query_table", None)
+            table = self._get_rule_table(base_rule)
             normalization = self.convert_correlation_search_field_normalization_expression(rule.aliases, rule_ref)
+            auto_norm = self._build_groupby_normalization(rule, rule_ref)
             for query in base_rule.get_conversion_result():
                 full_query = query
                 if normalization:
                     full_query = f"{full_query}\n{normalization}"
+                if auto_norm:
+                    full_query = f"{full_query}\n{auto_norm}"
                 if table:
                     full_query = f"{table}\n| where {full_query}"
                 full_query = f'{full_query}\n| extend EventType = "{rule_id}", EventOrder = {idx}'
@@ -315,7 +324,8 @@ class KustoBackend(TextQueryBackend):
 
         search = "union\n" + ",\n".join(subquery_parts)
 
-        groupby = (", " + ", ".join(rule.group_by)) if rule.group_by else ""
+        groupby_fields = self._resolve_groupby_fields(rule)
+        groupby = (", " + ", ".join(groupby_fields)) if groupby_fields else ""
         timespan = self._correlation_timespan_to_kql(rule.timespan)
         timestamp = self._get_timestamp_field()
 
@@ -451,7 +461,7 @@ class KustoBackend(TextQueryBackend):
         for rule_ref in rule.referenced_rules:
             base_rule = rule_ref.rule
             queries = base_rule.get_conversion_result()
-            table = getattr(base_rule, "_kusto_query_table", None)
+            table = self._get_rule_table(base_rule)
             normalization = self.convert_correlation_search_field_normalization_expression(rule.aliases, rule_ref)
             for query in queries:
                 full_query = query
@@ -462,6 +472,124 @@ class KustoBackend(TextQueryBackend):
                 subquery_parts.append(f"(\n{full_query}\n)")
 
         return "union\n" + ",\n".join(subquery_parts)
+
+    def _get_rule_table(self, rule) -> Optional[str]:
+        """Return the KQL table name for a base rule.
+
+        Priority:
+        1. ``rule._kusto_query_table`` — set by SetQueryTableStateTransformation (Python pipelines).
+        2. ``rule.custom_attributes['query_table']`` — set via ``set_custom_attribute`` in YAML pipelines.
+        """
+        table = getattr(rule, "_kusto_query_table", None)
+        if table is None:
+            table = getattr(rule, "custom_attributes", {}).get("query_table")
+        return table
+
+    def _resolve_field_for_table(self, sigma_field: str, table: Optional[str]) -> str:
+        """Return the KQL column name for *sigma_field* in the context of *table*.
+
+        Walks the active processing pipeline looking for a DynamicFieldMappingTransformation
+        that carries per-table mappings.  Falls back to generic mappings, then the original
+        Sigma field name when nothing matches.
+        """
+        pipeline = getattr(self, "last_processing_pipeline", None)
+        if pipeline is None:
+            return sigma_field
+        for item in pipeline.items:
+            t = item.transformation
+            fm = getattr(t, "field_mappings", None)
+            if fm is None:
+                continue
+            if table:
+                mapped = fm.table_mappings.get(table, {}).get(sigma_field)
+                if mapped:
+                    return mapped
+            generic = fm.generic_mappings.get(sigma_field)
+            if generic:
+                return generic
+        return sigma_field
+
+    def _reverse_resolve_field(self, kql_field: str, table: Optional[str]) -> Optional[str]:
+        """Reverse-lookup: given a KQL column name and a table, return the original Sigma field name.
+
+        Checks table-specific mappings first, then generic mappings.  Returns None if not found
+        (the field may already be a raw KQL name with no Sigma counterpart).
+        """
+        pipeline = getattr(self, "last_processing_pipeline", None)
+        if pipeline is None:
+            return None
+        for item in pipeline.items:
+            t = item.transformation
+            fm = getattr(t, "field_mappings", None)
+            if fm is None:
+                continue
+            if table:
+                rev = {v: k for k, v in fm.table_mappings.get(table, {}).items()}
+                if kql_field in rev:
+                    return rev[kql_field]
+            rev_generic = {v: k for k, v in fm.generic_mappings.items()}
+            if kql_field in rev_generic:
+                return rev_generic[kql_field]
+        return None
+
+    def _resolve_groupby_fields(self, rule: "SigmaCorrelationRule") -> list:  # type: ignore[name-defined]
+        """Return the list of KQL column names to use in the summarize group-by clause.
+
+        For aliased fields the alias name is used as-is.  For un-aliased fields we pick the
+        most-common KQL mapped name across all referenced rules so the name matches what
+        _build_groupby_normalization emits.
+        """
+        if not rule.group_by:
+            return []
+        aliased_fields = {alias.alias for alias in rule.aliases}
+        result = []
+        for kql_field in rule.group_by:
+            if kql_field in aliased_fields:
+                result.append(kql_field)
+                continue
+            # kql_field is already pipeline-mapped; reverse to sigma, then re-resolve per table
+            first_table = self._get_rule_table(rule.referenced_rules[0].rule) if rule.referenced_rules else None
+            sigma_field = self._reverse_resolve_field(kql_field, first_table) or kql_field
+            mapped_names = [
+                self._resolve_field_for_table(sigma_field, self._get_rule_table(rr.rule))
+                for rr in rule.referenced_rules
+            ]
+            canonical = Counter(mapped_names).most_common(1)[0][0]
+            result.append(canonical)
+        return result
+
+    def _build_groupby_normalization(self, rule: "SigmaCorrelationRule", rule_ref) -> str:  # type: ignore[name-defined]
+        """Return ``| extend`` lines that normalize group-by fields whose KQL column name
+        differs across the referenced rules.
+
+        For each un-aliased group-by field (already pipeline-mapped to a KQL name):
+          1. Reverse-resolve to the original Sigma field name.
+          2. Forward-resolve for every referenced rule's table.
+          3. Pick the most-common mapped name as the canonical column name.
+          4. Emit ``| extend <canonical> = <actual>`` for rules where actual != canonical.
+        """
+        if not rule.group_by:
+            return ""
+
+        aliased_fields = {alias.alias for alias in rule.aliases}
+        base_rule = rule_ref.rule
+        table = self._get_rule_table(base_rule)
+
+        extends = []
+        for kql_field in rule.group_by:
+            if kql_field in aliased_fields:
+                continue  # alias machinery handles this already
+            first_table = self._get_rule_table(rule.referenced_rules[0].rule) if rule.referenced_rules else None
+            sigma_field = self._reverse_resolve_field(kql_field, first_table) or kql_field
+            mapped_names = [
+                self._resolve_field_for_table(sigma_field, self._get_rule_table(rr.rule))
+                for rr in rule.referenced_rules
+            ]
+            canonical = Counter(mapped_names).most_common(1)[0][0]
+            my_mapped = self._resolve_field_for_table(sigma_field, table)
+            if my_mapped != canonical:
+                extends.append(f"| extend {canonical} = {my_mapped}")
+        return "\n".join(extends)
 
     def _get_timestamp_field(self) -> str:
         """Return the timestamp field name, preferring any value set by the active pipeline."""
