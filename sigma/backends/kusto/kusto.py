@@ -485,35 +485,44 @@ class KustoBackend(TextQueryBackend):
             table = getattr(rule, "custom_attributes", {}).get("query_table")
         return table
 
-    def _resolve_field_for_table(self, sigma_field: str, table: Optional[str]) -> str:
+    def _resolve_field_for_table(self, sigma_field: str, table: Optional[str], base_rule=None) -> str:
         """Return the KQL column name for *sigma_field* in the context of *table*.
 
-        Walks the active processing pipeline looking for a DynamicFieldMappingTransformation
-        that carries per-table mappings.  Falls back to generic mappings, then the original
-        Sigma field name when nothing matches.
+        First checks DynamicFieldMappingTransformation (per-table mappings used by built-in
+        pipelines).  Then falls back to flat FieldMappingTransformation items whose
+        rule_conditions match *base_rule* (used by custom YAML pipelines).  Finally returns
+        the original Sigma field name unchanged.
         """
         pipeline = getattr(self, "last_processing_pipeline", None)
         if pipeline is None:
             return sigma_field
         for item in pipeline.items:
             t = item.transformation
+            # Table-aware mappings (DynamicFieldMappingTransformation from built-in pipelines)
             fm = getattr(t, "field_mappings", None)
-            if fm is None:
+            if fm is not None:
+                if table:
+                    mapped = fm.table_mappings.get(table, {}).get(sigma_field)
+                    if mapped:
+                        return mapped
+                generic = fm.generic_mappings.get(sigma_field)
+                if generic:
+                    return generic
                 continue
-            if table:
-                mapped = fm.table_mappings.get(table, {}).get(sigma_field)
-                if mapped:
-                    return mapped
-            generic = fm.generic_mappings.get(sigma_field)
-            if generic:
-                return generic
+            # Flat mappings (FieldMappingTransformation from custom YAML pipelines)
+            flat = getattr(t, "mapping", None)
+            if flat and sigma_field in flat:
+                if base_rule is None or item.match_rule_conditions(base_rule):
+                    result = flat[sigma_field]
+                    return result[0] if isinstance(result, list) else result
         return sigma_field
 
-    def _reverse_resolve_field(self, kql_field: str, table: Optional[str]) -> Optional[str]:
-        """Reverse-lookup: given a KQL column name and a table, return the original Sigma field name.
+    def _reverse_resolve_field(self, kql_field: str, table: Optional[str], base_rule=None) -> Optional[str]:
+        """Reverse-lookup: given a KQL column name, return the original Sigma field name.
 
-        Checks table-specific mappings first, then generic mappings.  Returns None if not found
-        (the field may already be a raw KQL name with no Sigma counterpart).
+        Checks table-specific mappings first, then generic mappings (built-in pipelines),
+        then flat FieldMappingTransformation items matching *base_rule* (custom pipelines).
+        Returns None if not found (the field may already be a raw KQL name).
         """
         pipeline = getattr(self, "last_processing_pipeline", None)
         if pipeline is None:
@@ -521,15 +530,21 @@ class KustoBackend(TextQueryBackend):
         for item in pipeline.items:
             t = item.transformation
             fm = getattr(t, "field_mappings", None)
-            if fm is None:
+            if fm is not None:
+                if table:
+                    rev = {v: k for k, v in fm.table_mappings.get(table, {}).items()}
+                    if kql_field in rev:
+                        return rev[kql_field]
+                rev_generic = {v: k for k, v in fm.generic_mappings.items()}
+                if kql_field in rev_generic:
+                    return rev_generic[kql_field]
                 continue
-            if table:
-                rev = {v: k for k, v in fm.table_mappings.get(table, {}).items()}
-                if kql_field in rev:
-                    return rev[kql_field]
-            rev_generic = {v: k for k, v in fm.generic_mappings.items()}
-            if kql_field in rev_generic:
-                return rev_generic[kql_field]
+            flat = getattr(t, "mapping", None)
+            if flat:
+                if base_rule is None or item.match_rule_conditions(base_rule):
+                    rev_flat = {v: k for k, v in flat.items() if not isinstance(v, list)}
+                    if kql_field in rev_flat:
+                        return rev_flat[kql_field]
         return None
 
     def _resolve_groupby_fields(self, rule: "SigmaCorrelationRule") -> list:  # type: ignore[name-defined]
@@ -543,15 +558,16 @@ class KustoBackend(TextQueryBackend):
             return []
         aliased_fields = {alias.alias for alias in rule.aliases}
         result = []
+        first_ref = rule.referenced_rules[0] if rule.referenced_rules else None
         for kql_field in rule.group_by:
             if kql_field in aliased_fields:
                 result.append(kql_field)
                 continue
-            # kql_field is already pipeline-mapped; reverse to sigma, then re-resolve per table
-            first_table = self._get_rule_table(rule.referenced_rules[0].rule) if rule.referenced_rules else None
-            sigma_field = self._reverse_resolve_field(kql_field, first_table) or kql_field
+            first_table = self._get_rule_table(first_ref.rule) if first_ref else None
+            first_rule = first_ref.rule if first_ref else None
+            sigma_field = self._reverse_resolve_field(kql_field, first_table, first_rule) or kql_field
             mapped_names = [
-                self._resolve_field_for_table(sigma_field, self._get_rule_table(rr.rule))
+                self._resolve_field_for_table(sigma_field, self._get_rule_table(rr.rule), rr.rule)
                 for rr in rule.referenced_rules
             ]
             canonical = Counter(mapped_names).most_common(1)[0][0]
@@ -564,7 +580,7 @@ class KustoBackend(TextQueryBackend):
 
         For each un-aliased group-by field (already pipeline-mapped to a KQL name):
           1. Reverse-resolve to the original Sigma field name.
-          2. Forward-resolve for every referenced rule's table.
+          2. Forward-resolve per referenced rule's table, using rule conditions for flat mappings.
           3. Pick the most-common mapped name as the canonical column name.
           4. Emit ``| extend <canonical> = <actual>`` for rules where actual != canonical.
         """
@@ -574,19 +590,21 @@ class KustoBackend(TextQueryBackend):
         aliased_fields = {alias.alias for alias in rule.aliases}
         base_rule = rule_ref.rule
         table = self._get_rule_table(base_rule)
+        first_ref = rule.referenced_rules[0] if rule.referenced_rules else None
 
         extends = []
         for kql_field in rule.group_by:
             if kql_field in aliased_fields:
                 continue  # alias machinery handles this already
-            first_table = self._get_rule_table(rule.referenced_rules[0].rule) if rule.referenced_rules else None
-            sigma_field = self._reverse_resolve_field(kql_field, first_table) or kql_field
+            first_table = self._get_rule_table(first_ref.rule) if first_ref else None
+            first_rule = first_ref.rule if first_ref else None
+            sigma_field = self._reverse_resolve_field(kql_field, first_table, first_rule) or kql_field
             mapped_names = [
-                self._resolve_field_for_table(sigma_field, self._get_rule_table(rr.rule))
+                self._resolve_field_for_table(sigma_field, self._get_rule_table(rr.rule), rr.rule)
                 for rr in rule.referenced_rules
             ]
             canonical = Counter(mapped_names).most_common(1)[0][0]
-            my_mapped = self._resolve_field_for_table(sigma_field, table)
+            my_mapped = self._resolve_field_for_table(sigma_field, table, base_rule)
             if my_mapped != canonical:
                 extends.append(f"| extend {canonical} = {my_mapped}")
         return "\n".join(extends)
